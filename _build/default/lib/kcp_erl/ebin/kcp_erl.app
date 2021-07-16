@@ -1,0 +1,10 @@
+{application,kcp_erl,
+             [{description,"An OTP application"},
+              {vsn,"0.1.0"},
+              {registered,[]},
+              {mod,{kcp_erl_app,[]}},
+              {applications,[kernel,stdlib]},
+              {env,[]},
+              {modules,[kcp_erl_app,kcp_erl_sup]},
+              {licenses,["Apache 2.0"]},
+              {links,[]}]}.
