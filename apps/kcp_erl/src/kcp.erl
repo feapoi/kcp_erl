@@ -161,18 +161,18 @@ send(Kcp, <<>>) -> %% 如果数据为空，直接退出
 send(Kcp, Buffer) ->
     %% append to previous segment in streaming mode (if possible)
     %% 如果是流模式，则判断是否与现有Segment合并
-    SndQueueReverse = lists:reverse(Kcp#kcp.snd_queue),
+    SndQueue = Kcp#kcp.snd_queue,
     case Kcp#kcp.stream of
         0 ->
-            {SndQueueReverse, Buffer};
+            add_buff_2_seg(byte_size(Buffer), Kcp, Buffer, SndQueue);
         _ ->
-            N = erlang:length(SndQueueReverse),
-            {SndQueueReverse1, Buffer1} =
+            N = erlang:length(SndQueue),
+            {SndQueue1, Buffer1} =
                 %% 判断是否有未发送的消息
                 %% 此处只判定snd_queue，因为snd_buf中可能是已经发送，只不过未确认而没有删除的记录
                 case N > 0 of
                     true ->
-                        [Seg | SndQueueReverseO] = SndQueueReverse,  %% 将最后一条记录取出
+                        [Seg | SndQueue0] = SndQueue,  %% 将最后一条记录取出
                         DataLen = erlang:byte_size(Seg#segment.data),
                         BufferLen = erlang:byte_size(Buffer),
                         %% 如果还有剩余空间
@@ -184,12 +184,12 @@ send(Kcp, Buffer) ->
                                 %% grow slice, the underlying cap is guaranteed to
                                 %% be larger than kcp.mss
                                 <<Add2Seg:Extend, OtherBuffer/bytes>> = Buffer,
-                                {[Seg#segment{data = <<(Seg#segment.data)/bytes, Add2Seg/bytes>>} | SndQueueReverseO], OtherBuffer};
+                                {[Seg#segment{data = <<(Seg#segment.data)/bytes, Add2Seg/bytes>>} | SndQueue0], OtherBuffer};
                             _ ->
-                                {SndQueueReverse, Buffer}
+                                {SndQueue, Buffer}
                         end;
                     _ ->
-                        {SndQueueReverse, Buffer}
+                        {SndQueue, Buffer}
                 end,
             %% 如果buffer剩余的内容长度为0，表示已经完成数据的写入Segment的过程，结束
             case erlang:byte_size(Buffer1) of
@@ -197,28 +197,32 @@ send(Kcp, Buffer) ->
                     %% return 0
                     {Kcp, 0};
                 BufferLen1 ->
-                    Count =
-                        %% 以下说明中，无论是已经合并一部分到上一个Segment还是没有合并的情况，统统称呼为新数据
-                        %% 如果新数据小于一个新Segment的数据长度
-                        case BufferLen1 =< Kcp#kcp.mss of
-                            true ->
-                                1;
-                            _ ->
-                                (BufferLen1 + Kcp#kcp.mss - 1) div Kcp#kcp.mss
-                        end,
-                    %% 如果新增加的输入大于255个，直接表示无法发送  254*(1400-24)/1024=344KB的数据
-                    %% 想要多发数据，只能通过MTU进行设定
-                    case Count > 255 of
-                        %% return 2
-                        true -> {Kcp, -2};
-                        _ ->
-                            Count1 = ?IF(Count == 0, 1, Count),
-                            %% 遍历Segment数量
-                            loop_seg(0, Count1, BufferLen1, Buffer1, Kcp, SndQueueReverse1),
-                            {Kcp#kcp{snd_queue = lists:reverse(SndQueueReverse1)}, 0}
-                    end
+                    add_buff_2_seg(BufferLen1, Kcp, Buffer1, SndQueue1)
             end
     end.
+
+%% 把所有的buffer放入snd_queue
+add_buff_2_seg(BufferLen1, Kcp, Buffer1, SndQueue1) ->
+    Count =
+        %% 以下说明中，无论是已经合并一部分到上一个Segment还是没有合并的情况，统统称呼为新数据
+        %% 如果新数据小于一个新Segment的数据长度
+        case BufferLen1 =< Kcp#kcp.mss of
+            true ->
+                1;
+            _ ->
+                (BufferLen1 + Kcp#kcp.mss - 1) div Kcp#kcp.mss
+        end,
+        %% 如果新增加的输入大于255个，直接表示无法发送  254*(1400-24)/1024=344KB的数据
+        %% 想要多发数据，只能通过MTU进行设定
+        case Count > 255 of
+            %% return 2
+            true -> {Kcp, -2};
+            _ ->
+                Count1 = ?IF(Count == 0, 1, Count),
+                %% 遍历Segment数量
+                {_Buffer2, SndQueue2} = loop_seg(0, Count1, BufferLen1, Buffer1, Kcp, SndQueue1),
+                {Kcp#kcp{snd_queue = SndQueue2}, 0}
+        end.
 
 loop_seg(I, Count, _BufferLen, Buffer, _Kcp, SndQueueReverse) when I + 1 >= Count ->
     {Buffer, SndQueueReverse};
@@ -261,7 +265,7 @@ flush(Kcp, AckOnly) ->
         ,una = Kcp#kcp.rcv_nxt
     },
     Mtu = Kcp#kcp.mtu,
-    {_, Ptr1} = flush_acknowledges([], Kcp, Seg, <<>>),
+    {Seg0, Ptr1} = flush_acknowledges(Kcp#kcp.acklist, Kcp, Seg, <<>>),
     Kcp1 = Kcp#kcp{acklist = []},
 
     %% 仅仅更新acklist
@@ -297,13 +301,14 @@ flush(Kcp, AckOnly) ->
                 end,
 
             %% flush window probing commands
+            %% 请求或者告知窗口大小
             {Seg1, Ptr2} =
-                case Kcp2#kcp.probe band ?IKCP_ASK_SEND =/= 0 of
+                case Kcp2#kcp.probe band ?IKCP_ASK_SEND =/= 0 of            %% 如果需要探查，设定命令字
                     true ->
                         Ptr11 = make_space(?IKCP_OVERHEAD, Ptr1, Mtu),
-                        {Seg#segment{cmd = ?IKCP_CMD_WASK}, encode(Seg, Ptr11)};
+                        {Seg0#segment{cmd = ?IKCP_CMD_WASK}, encode(Seg0, Ptr11)};
                     _ ->
-                        {Seg, Ptr1}
+                        {Seg0, Ptr1}
                 end,
             {Seg2, Ptr3} =
                 case Kcp2#kcp.probe band ?IKCP_ASK_TELL =/= 0 of
@@ -320,12 +325,10 @@ flush(Kcp, AckOnly) ->
             Cwnd1 = ?IF(Kcp3#kcp.nocwnd == 0, min(Kcp3#kcp.cwnd, Cwnd)), %% 如果未取消拥塞控制,正在发送的数据大小与窗口尺寸比较
 
             %% sliding window, controlled by snd_nxt && sna_una+cwnd
-            {Kcp4, NewSegsCount} = sliding_window(Kcp3#kcp.snd_queue, Kcp3, 0, Cwnd1),
-            SndQueue = Kcp4#kcp.snd_queue,
-            LenSndQueue = erlang:length(SndQueue),
+            {Kcp4, NewSegsCount, ReserveSndQueue} = sliding_window(lists:reverse(Kcp3#kcp.snd_queue), Kcp3, 0, Cwnd1),
 
             %%  如果有将snd_queue中的数据移动至snd_buf中，则需要将snd_queue中的对应数据删除
-            Kcp5 = ?IF(NewSegsCount > 0, Kcp4#kcp{snd_queue = lists:sublist(SndQueue, NewSegsCount + 1, LenSndQueue - NewSegsCount)}, Kcp4),
+            Kcp5 = Kcp4#kcp{snd_queue = lists:reverse(ReserveSndQueue)},
 
             %% 设置重传策略
             %% calculate resent
@@ -348,9 +351,10 @@ flush(Kcp, AckOnly) ->
                             case Change > 0 of
                                 true ->
                                     Inflight = Kcp6#kcp.snd_nxt - Kcp6#kcp.snd_una,     %% 待发送的与未确认最小值得差值==未确认的总数
+                                    NewSsThresh = ?IF(Inflight div 2 < ?IKCP_THRESH_MIN, ?IKCP_THRESH_MIN, Inflight div 2),
                                     Kcp6#kcp{
-                                        ssthresh = ?IF(Inflight div 2 < ?IKCP_THRESH_MIN, ?IKCP_THRESH_MIN, Inflight div 2) %% 如果 拥塞窗口阈值 小于 拥塞窗口最小值
-                                        ,cwnd = Kcp6#kcp.ssthresh + Resent              %% 拥塞窗口阈值+重传数量
+                                        ssthresh =  NewSsThresh %% 如果 拥塞窗口阈值 小于 拥塞窗口最小值
+                                        ,cwnd = NewSsThresh + Resent              %% 拥塞窗口阈值+重传数量
                                         ,incr = Kcp6#kcp.cwnd * Kcp6#kcp.mss            %% 可发送的最大数据量=拥塞窗口*最大分片大小
                                     };
                                 _ ->
@@ -403,7 +407,7 @@ bounds_check_elimination([#segment{xmit = Xmit, fastack = FastAck, resendts = Re
                         rto = Kcp#kcp.rx_rto,           %% 重传超时时间
                         resendts = Current + Seg#segment.rto    %% 发送时间
                     }, Change, LostSegs};
-                    FastAck >= Resent -> {true, Seg#segment{ %% fast retransmit 快速确认act数>快速重传数
+                    FastAck >= Resent -> {true, Seg#segment{ %% fast retransmit 快速确认ack数>快速重传数
                         fastack = 0,
                         rto = Kcp#kcp.rx_rto,
                         resendts = Current + Seg#segment.rto
@@ -452,11 +456,11 @@ bounds_check_elimination([#segment{xmit = Xmit, fastack = FastAck, resendts = Re
 %% kcp.snd_nxt[待发送的sn]-(kcp.snd_una[已经确认的连续sn号]+cwnd[发送途中的数量])>=0
 %% 表示发送中+未确认的已经大于cwnd的尺寸了，需要等待
 sliding_window([], Kcp, NewSegsCount, _Cwnd) ->
-    {Kcp, NewSegsCount};
+    {Kcp, NewSegsCount, []};
 sliding_window([NewSeg | SndQueue], Kcp, NewSegsCount, Cwnd) ->
     case Kcp#kcp.snd_nxt - Kcp#kcp.snd_una - Cwnd >= 0 of
         true->
-            {Kcp, NewSegsCount};
+            {Kcp, NewSegsCount, [NewSeg | SndQueue]};
         _ ->
             sliding_window(SndQueue,
                 Kcp#kcp{
@@ -474,9 +478,9 @@ flush_acknowledges([], _Kcp, Seg, Ptr) ->
     {Seg, Ptr};
 flush_acknowledges([Ack | AckList], Kcp, Seg, Ptr) ->
     Ptr1 = make_space(?IKCP_OVERHEAD, Ptr, Kcp#kcp.mtu),
-    case Ack#segment.sn - Kcp#kcp.rcv_nxt >= 0 orelse AckList == [] of
+    case Ack#segment.sn >= Kcp#kcp.rcv_nxt orelse AckList == [] of
         true ->
-            {Seg#segment{sn = Ack#segment.sn, ts = Ack#segment.ts}, encode(Ptr, Seg)};
+            flush_acknowledges(AckList, Kcp, Seg#segment{sn = Ack#segment.sn, ts = Ack#segment.ts}, encode(Seg, Ptr));
         _ ->
             flush_acknowledges(AckList, Kcp, Seg, Ptr1)
     end.
