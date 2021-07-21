@@ -641,15 +641,15 @@ loop_decode(Data, Kcp, Regular, WindowSlides, InSegs, Flag, Latest) ->
                                 WindowSlides1 = ?IF(Count > 0, true, WindowSlides),   %% 如果有新的确认数据
                                 Kcp3 = kcp_utils:shrink_buf(Kcp2),
                                 case Cmd of
-                                    ?IKCP_CMD_ACK ->  %% 窗口应答数据
+                                    ?IKCP_CMD_ACK ->  %% 确认命令
                                         Kcp31 = kcp_utils:parse_ack(Kcp3, Sn),  %% 确认snd_buf中的数据是否存在已经确认，但是未删除的seg，删除掉，空出空间
                                         Kcp32 = kcp_utils:parse_fast_ack(Kcp31, Sn, Ts), %% 更新快速确认数，判断snd_buf中，是否存在，sn小，ts也比较早的数据，进行快速确认，以便空出空间
                                         {Flag bxor 1, Ts, Kcp32, WindowSlides1};
                                     ?IKCP_CMD_PUSH ->   %% 用户数据
-                                        case Sn - Kcp#kcp.rcv_nxt + Kcp#kcp.rcv_wnd < 0 of
+                                        case Sn < (Kcp#kcp.rcv_nxt + Kcp#kcp.rcv_wnd) of
                                             true ->
                                                 Kcp1 = kcp_utils:ack_push(Kcp, Sn, Ts), %% 更新acklist表
-                                                case Sn - Kcp#kcp.rcv_nxt of
+                                                case Sn >= Kcp#kcp.rcv_nxt of
                                                     true ->
                                                         Seg = #segment{
                                                             conv = Conv
@@ -688,14 +688,14 @@ loop_decode(Data, Kcp, Regular, WindowSlides, InSegs, Flag, Latest) ->
 
 parse_data(Kcp, Seg) ->
     Sn = Seg#segment.sn,
-    case Sn - Kcp#kcp.rcv_nxt - Kcp#kcp.rcv_wnd >= 0 orelse Sn - Kcp#kcp.rcv_nxt < 0 of
+    case Sn > (Kcp#kcp.rcv_nxt + Kcp#kcp.rcv_wnd) orelse Sn < Kcp#kcp.rcv_nxt of
         true ->
             true;
         _ ->
             N = erlang:length(Kcp#kcp.rcv_buf) - 1,
             InsertIdx = 0,
             Repeat = false,
-            {Repeat1, InsertIdx1} = loop_parse_data_1(N, Kcp#kcp.rcv_buf, Sn, Repeat, InsertIdx),
+            {Repeat1, InsertIdx1} = loop_parse_data_1(N, lists:reverse(Kcp#kcp.rcv_buf), Sn, Repeat, InsertIdx),
             Kcp1 =
                 case not Repeat1 of
                     true ->
@@ -729,7 +729,7 @@ loop_parse_data_1(I, [Seg | RcvBuf], Sn, Repeat, InsertIdx) ->
     case Seg#segment.sn == Sn of
         true ->{true, InsertIdx};
         _ ->
-            case Sn - Seg#segment.sn > 0 of
+            case Sn > Seg#segment.sn of
                 true ->
                     {Repeat, I + 1};
                 _ ->
