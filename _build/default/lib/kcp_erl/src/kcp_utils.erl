@@ -12,33 +12,19 @@
 -include("include/kcp.hrl").
 
 %% API
--export([parse_ack/2, parse_fast_ack/3, ack_push/3, parse_una/3, shrink_buf/1, update_ack/2]).
+-export([parse_ack/2, parse_fast_ack/3, ack_push/3, parse_una/3, shrink_buf/1, update_ack/2, name/1]).
 
-%% 确认snd_buf（接收队列）中的数据是否存在已经确认，但是未删除的seg，删除掉，空出空间
+name(Port) ->
+    erlang:list_to_atom("kcp_"++erlang:integer_to_list(Port)).
+
+%% 确认snd_buf（接收队列）中的数据是否存在已经确认但是未删除的seg，删除掉，空出空间
 parse_ack(Kcp, Sn) ->
     %% 序号小于第一个未确认的包
     %% 序号大于等于下一个要发送的包
-    case Sn - Kcp#kcp.snd_una < 0 orelse Sn - Kcp#kcp.snd_nxt >= 0 of
+    case Sn < Kcp#kcp.snd_una orelse Sn >= Kcp#kcp.snd_nxt of
         true -> Kcp;
         _ ->
-            Del = loop_parse_ack(Kcp#kcp.snd_buf, Sn),
-            Kcp#kcp{snd_buf = Kcp#kcp.snd_buf -- Del}
-    end.
-
-loop_parse_ack([], _Sn) ->
-    [];
-loop_parse_ack([Seg | SndBuf], Sn) ->
-    case Sn =:= Seg#segment.sn of
-        true->
-            %% kcp.delSegment(seg),
-            [Seg];
-        _ ->
-            case Sn - Seg#segment.sn < 0 of
-                true ->
-                    [];
-                _ ->
-                    loop_parse_ack(SndBuf, Sn)
-            end
+            Kcp#kcp{snd_buf = lists:keydelete(Sn, #segment.sn, Kcp#kcp.snd_buf)}
     end.
 
 %% 更新快速确认数，判断snd_buf中，是否存在，sn小，ts也比较早的数据，进行快速确认，以便空出空间
@@ -54,11 +40,11 @@ parse_fast_ack(Kcp, Sn, Ts) ->
 loop_parse_fast_ack([], Res, _Sn, _Ts) ->
     lists:reverse(Res);
 loop_parse_fast_ack([Seg | SndBuf], Res, Sn, Ts) ->
-    case Sn > Seg#segment.sn of
+    case Sn < Seg#segment.sn of
         true->
             lists:reverse(Res) ++ [Seg | SndBuf];
         _ ->
-            case Sn =/= Seg#segment.sn andalso Seg#segment.ts - Ts =< 0 of
+            case Sn =/= Seg#segment.sn andalso Seg#segment.ts =< Ts  of
                 true ->
                     loop_parse_fast_ack(SndBuf, Res, Sn, [Seg#segment{fastack = Seg#segment.fastack + 1} | Ts]) ;
                 _ ->
@@ -100,6 +86,7 @@ update_ack(Kcp, Rtt) ->
                     %% if the new RTT sample is below the bottom of the range of
                     %% what an RTT measurement is expected to be.
                     %% give an 8x reduced weight versus its normal weighting
+                    %% 如果新的RTT样本低于预期的RTT测量范围的底部。给一个8倍于正常重量的减重
                     true -> Kcp01#kcp{rx_rttvar = Kcp01#kcp.rx_rttvar + (Delta1 - Kcp01#kcp.rx_rttvar) bsr 5};
                     _ -> Kcp01#kcp{rx_rttvar = Kcp01#kcp.rx_rttvar + (Delta1 - Kcp01#kcp.rx_rttvar) bsr 2}
                 end

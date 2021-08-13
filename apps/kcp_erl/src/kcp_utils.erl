@@ -12,7 +12,10 @@
 -include("include/kcp.hrl").
 
 %% API
--export([parse_ack/2, parse_fast_ack/3, ack_push/3, parse_una/3, shrink_buf/1, update_ack/2]).
+-export([parse_ack/2, parse_fast_ack/3, ack_push/3, parse_una/3, shrink_buf/1, update_ack/2, name/1]).
+
+name(Port) ->
+    erlang:list_to_atom("kcp_"++erlang:integer_to_list(Port)).
 
 %% 确认snd_buf（接收队列）中的数据是否存在已经确认但是未删除的seg，删除掉，空出空间
 parse_ack(Kcp, Sn) ->
@@ -83,6 +86,7 @@ update_ack(Kcp, Rtt) ->
                     %% if the new RTT sample is below the bottom of the range of
                     %% what an RTT measurement is expected to be.
                     %% give an 8x reduced weight versus its normal weighting
+                    %% 如果新的RTT样本低于预期的RTT测量范围的底部。给一个8倍于正常重量的减重
                     true -> Kcp01#kcp{rx_rttvar = Kcp01#kcp.rx_rttvar + (Delta1 - Kcp01#kcp.rx_rttvar) bsr 5};
                     _ -> Kcp01#kcp{rx_rttvar = Kcp01#kcp.rx_rttvar + (Delta1 - Kcp01#kcp.rx_rttvar) bsr 2}
                 end

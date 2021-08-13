@@ -8,7 +8,7 @@
 %%%-------------------------------------------------------------------
 -author("100621").
 -define(IF(_CONDITION, _DO), ?IF(_CONDITION, _DO, ok)).
--define(IF(_CONDITION, _DO, _ELSE), case _CONDITION of true -> _DO; else -> _ELSE end).
+-define(IF(_CONDITION, _DO, _ELSE), case _CONDITION of true -> _DO; _ -> _ELSE end).
 
 -define(CURRENT, erlang:system_time(millisecond) - persistent_term:get(current)).
 
@@ -61,7 +61,7 @@
     ,fastresend = 0
     %% 取消拥塞控制，是否是流模式
     ,nocwnd = 0, stream = 0
-    %% 发送队列; 发送buf; 接收队列; 接收buf
+    %% 发送队列; 接收队列;发送buf; 接收buf
     ,snd_queue = [], rcv_queue = [], snd_buf = [], rcv_buf = []
     %% 待发送的ack列表(包含sn与ts)  |sn0|ts0|sn1|ts1|... 形式存在
     ,acklist = []
@@ -69,8 +69,9 @@
     ,buffer = <<>>
     %% 不同协议保留位数
     ,reserved = 0
+    ,host,port
     %% 回调函数
-    ,output
+    %%,output
 }).
 
 -record(segment, {

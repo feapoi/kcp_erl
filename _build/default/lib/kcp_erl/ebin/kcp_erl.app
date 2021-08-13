@@ -5,6 +5,6 @@
               {mod,{kcp_erl_app,[]}},
               {applications,[kernel,stdlib]},
               {env,[]},
-              {modules,[kcp_erl_app,kcp_erl_sup]},
+              {modules,[kcp,kcp_erl_app,kcp_erl_sup,kcp_server,kcp_utils]},
               {licenses,["Apache 2.0"]},
               {links,[]}]}.

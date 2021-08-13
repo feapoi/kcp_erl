@@ -8,31 +8,31 @@
 %%%-------------------------------------------------------------------
 -author("100621").
 -define(IF(_CONDITION, _DO), ?IF(_CONDITION, _DO, ok)).
--define(IF(_CONDITION, _DO, _ELSE), case _CONDITION of true -> _DO; else -> _ELSE end).
+-define(IF(_CONDITION, _DO, _ELSE), case _CONDITION of true -> _DO; _ -> _ELSE end).
 
 -define(CURRENT, erlang:system_time(millisecond) - persistent_term:get(current)).
 
--define(IKCP_RTO_NDL, 30).
--define(IKCP_RTO_MIN, 100).
+-define(IKCP_RTO_NDL, 30).                  %% no delay min rto
+-define(IKCP_RTO_MIN, 100).                 %% normal min rto
 -define(IKCP_RTO_DEF, 200).
 -define(IKCP_RTO_MAX, 60000).
--define(IKCP_CMD_PUSH, 81).
--define(IKCP_CMD_ACK, 82).
--define(IKCP_CMD_WASK, 83).
--define(IKCP_CMD_WINS, 84).
--define(IKCP_ASK_SEND, 1).
--define(IKCP_ASK_TELL, 2).
--define(IKCP_WND_SND, 32).
+-define(IKCP_CMD_PUSH, 81).                 %% cmd: push data 数据推送命
+-define(IKCP_CMD_ACK, 82).                  %% cmd: ack		确认命令
+-define(IKCP_CMD_WASK, 83).                 %% cmd: window probe (ask)	接收窗口大小询问命令
+-define(IKCP_CMD_WINS, 84).                 %% cmd: window size (tell)	接收窗口大小告知命令
+-define(IKCP_ASK_SEND, 1).                  %% need to send IKCP_CMD_WASK	表示请求远端告知窗口大小
+-define(IKCP_ASK_TELL, 2).                  %% need to send IKCP_CMD_WINS 表示告知远端窗口大小
+-define(IKCP_WND_SND, 32).                  %% send win size			发送窗口大小
 -define(IKCP_WND_RCV, 32).
--define(IKCP_MTU_DEF, 1400).
+-define(IKCP_MTU_DEF, 1400).                %% 最大传输单元 MSS(最大片段尺寸)=MTU-OVERHEAD
 -define(IKCP_ACK_FAST, 3).
--define(IKCP_INTERVAL, 100).
--define(IKCP_OVERHEAD, 24).
--define(IKCP_DEADLINK, 20).
--define(IKCP_THRESH_INIT, 2).
--define(IKCP_THRESH_MIN, 2).
--define(IKCP_PROBE_INIT, 7000).
--define(IKCP_PROBE_LIMIT, 120000).
+-define(IKCP_INTERVAL, 100).                %% 最小重传时间(单位ms)
+-define(IKCP_OVERHEAD, 24).                 %% 头信息大小
+-define(IKCP_DEADLINK, 20).                 %% 最大重传次
+-define(IKCP_THRESH_INIT, 2).               %% 拥塞窗口初始值
+-define(IKCP_THRESH_MIN, 2).                %% 拥塞窗口最小值
+-define(IKCP_PROBE_INIT, 7000).             %% 7 secs to probe window size
+-define(IKCP_PROBE_LIMIT, 120000).          %% up to 120 secs to probe window
 -define(IKCP_SN_OFFSET, 12).
 
 
@@ -61,7 +61,7 @@
     ,fastresend = 0
     %% 取消拥塞控制，是否是流模式
     ,nocwnd = 0, stream = 0
-    %% 发送队列; 发送buf; 接收队列; 接收buf
+    %% 发送队列; 接收队列;发送buf; 接收buf
     ,snd_queue = [], rcv_queue = [], snd_buf = [], rcv_buf = []
     %% 待发送的ack列表(包含sn与ts)  |sn0|ts0|sn1|ts1|... 形式存在
     ,acklist = []
@@ -69,8 +69,9 @@
     ,buffer = <<>>
     %% 不同协议保留位数
     ,reserved = 0
+    ,host,port
     %% 回调函数
-    ,output
+    %%,output
 }).
 
 -record(segment, {
