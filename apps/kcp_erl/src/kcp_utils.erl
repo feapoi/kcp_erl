@@ -64,7 +64,7 @@ parse_una([Seg | SndBuf], Una, Count) ->
     end.
 
 shrink_buf(Kcp) ->
-    case erlang:byte_size(Kcp#kcp.snd_buf) > 0 of
+    case erlang:length(Kcp#kcp.snd_buf) > 0 of
         true ->
             [Seg | _] = Kcp#kcp.snd_buf,
             Kcp#kcp{snd_una = Seg#segment.una};

@@ -75,8 +75,8 @@
 }).
 
 -record(segment, {
-    conv = 0
-    ,cmd = 0
+%%    conv = 0
+    cmd = 0
     ,frg = 0    %% 分片
     ,wnd = 0    %% 接收窗口大小
     ,ts = 0     %% 时间序列

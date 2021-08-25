@@ -121,7 +121,7 @@ start_link(Port) ->
 
 init(Port) ->
     erlang:register(kcp_utils:name(Port), self()),
-    {ok, Socket} = gen_udp:open(Port),
+    {ok, Socket} = gen_udp:open(Port, [{mode, binary}]),
     {ok, #kcp{conv = Socket}}.
 
 handle_call(_Request, _From, State = #kcp{}) ->
@@ -133,17 +133,8 @@ handle_cast(recv, Kcp) ->
         io:format("Res:~p~n", [Res]),
         {noreply, Kcp1}
     catch
-        throw:_ ->
-            {noreply, Kcp}
-    end;
-
-handle_cast({udp, _Socket, _, _, Data}, Kcp) ->
-    try
-        io:format("Data:~p~n", [Data]),
-        {Kcp1, _} = input(Kcp, Data, true, false),
-        {noreply, Kcp1}
-    catch
-        throw:_ ->
+        throw:Err ->
+            io:format("recv Err:~p~n", [Err]),
             {noreply, Kcp}
     end;
 
@@ -152,7 +143,8 @@ handle_cast({flush, AckOnly}, Kcp) ->
         {Kcp1, _} = flush(Kcp, AckOnly),
         {noreply, Kcp1}
     catch
-        throw:_ ->
+        throw:Err ->
+            io:format("flush Err:~p~n", [Err]),
             {noreply, Kcp}
     end;
 
@@ -175,29 +167,55 @@ handle_cast({set_host_and_port, Host, Port}, Kcp) ->
             {noreply, Kcp}
     end;
 
-handle_cast(loop, Kcp) ->
+handle_cast(no_delay, Kcp) ->
     try
-        gen_server:cast(self(), {flush, false}),
-        erlang:send_after(1000, self(), loop),
-        {noreply, Kcp}
+        Kcp1 = no_delay(Kcp, 1, 20, 2, 1),
+        {noreply, Kcp1}
     catch
         throw:_ ->
             {noreply, Kcp}
     end;
 
+
 handle_cast(start_loop, Kcp) ->
     try
+        io:format("start_loop~n", []),
         persistent_term:put(current, erlang:system_time(millisecond)),
-        gen_server:cast(self(), loop),
+        self() ! loop,
         {noreply, Kcp}
     catch
-        throw:_ ->
+        throw:Err ->
+            io:format("start_loop Err:~p~n", [Err]),
             {noreply, Kcp}
     end;
 
 handle_cast(_Request, State = #kcp{}) ->
     io:format("error", []),
     {noreply, State}.
+
+handle_info(loop, Kcp) ->
+    try
+        %%io:format("loop", []),
+        gen_server:cast(self(), {flush, false}),
+        erlang:send_after(Kcp#kcp.interval, self(), loop),
+        {noreply, Kcp}
+    catch
+        throw:Err ->
+            io:format("loop Err:~p~n", [Err]),
+            {noreply, Kcp}
+    end;
+
+handle_info({udp, _Socket, _, _, Data}, Kcp) ->
+    try
+        %%io:format("Data:~p~n", [Data]),
+        {Kcp1, _} = input(Kcp, Data, true, false),
+        {noreply, Kcp1}
+    catch
+        throw:Err ->
+            io:format("input Err:~p~n", [Err]),
+            {noreply, Kcp}
+    end;
+
 
 handle_info(_Info, State = #kcp{}) ->
     {noreply, State}.
@@ -302,7 +320,7 @@ loop_seg(I, Count, BufferLen, Buffer, Kcp, SndQueueReverse) ->
     <<Add:BitSize, OtherBuffer/bytes>> = Buffer,
     Seg1 = Seg#segment{
         %% 将数据存放到新的Segment中
-        data = Add
+        data = <<Add:BitSize>>
         %% message mode 如果是消息模式，则需要将frg标记号码，从大到小,stream mode	如果是流模式，就不需要
         ,frg = ?IF(Kcp#kcp.stream == 0, Count - I - 1, 0)
     },
@@ -325,8 +343,8 @@ loop_seg(I, Count, BufferLen, Buffer, Kcp, SndQueueReverse) ->
 %% */
 flush(Kcp, AckOnly) ->
     Seg = #segment{
-        conv = Kcp#kcp.conv
-        ,cmd = ?IKCP_CMD_ACK
+%%        conv = Kcp#kcp.conv
+        cmd = ?IKCP_CMD_ACK
         ,wnd = wnd_unused(Kcp)
         ,una = Kcp#kcp.rcv_nxt
     },
@@ -457,6 +475,7 @@ flush(Kcp, AckOnly) ->
 flush_buffer(_,_,_,<<>>) ->
     ok;
 flush_buffer(Socket,Host,Port,Ptr) ->
+    %%io:format("to:~p,udp:~p~n", [Port,Ptr]),
     gen_udp:send(Socket, Host,Port, Ptr).
 
 %% 将确定要检查的内容进行遍历
@@ -485,7 +504,9 @@ bounds_check_elimination([#segment{xmit = Xmit, fastack = FastAck, resendts = Re
                     }, Change + 1, LostSegs};
                     Current - Resendts >= 0 -> {true, Seg#segment{  %% RTO  当前时间已经达到重传时间的
                         fastack = 0,
-                        rto = ?IF(Kcp#kcp.nodelay == 0, Kcp#kcp.rx_rto, Kcp#kcp.rx_rto div 2), %% 如果不启动无延迟模式(延迟)；当前Segment的每一次重传时间加rx_rto
+                        %% RTO翻倍vs不翻倍：TCP超时计算是RTOx2，这样连续丢三次包就变成RTOx8了，十分恐怖，而KCP启动快速模式后不x2，只是x1.5（实验证明1.5这个值相对比较好），提高了传输速度。
+                        %% 如果不启动无延迟模式(延迟)；当前Segment的每一次重传时间加rx_rto
+                        rto = ?IF(Kcp#kcp.nodelay == 0, Seg#segment.rto + Kcp#kcp.rx_rto, Seg#segment.rto + Kcp#kcp.rx_rto div 2),
                         resendts = Current + Seg#segment.rto
                     }, Change, LostSegs + 1};
                     true -> {false, Seg, Change, LostSegs}
@@ -531,7 +552,7 @@ sliding_window([NewSeg | SndQueue], Kcp, NewSegsCount, Cwnd) ->
             sliding_window(SndQueue,
                 Kcp#kcp{
                 snd_buf = Kcp#kcp.snd_buf ++ [NewSeg#segment{ %% 从开始位置取数据,将数据移动到snd_buf中去
-                    conv = Kcp#kcp.conv, %% 客户端号，一个客户端的号码在同一次启动中是唯一的
+%%                    conv = Kcp#kcp.conv, %% 客户端号，一个客户端的号码在同一次启动中是唯一的
                     cmd = ?IKCP_CMD_PUSH, %% 数据推出命令字
                     sn = Kcp#kcp.snd_nxt %% 设定
                     }],
@@ -542,32 +563,32 @@ sliding_window([NewSeg | SndQueue], Kcp, NewSegsCount, Cwnd) ->
 %% acklist中数据发送
 flush_acknowledges([], _Kcp, Seg, Ptr) ->
     {Seg, Ptr};
-flush_acknowledges([Ack | AckList], Kcp, Seg, Ptr) ->
+flush_acknowledges([{Sn, Ts} | AckList], Kcp, Seg, Ptr) ->
     Ptr1 = make_space(Kcp#kcp.conv,Kcp#kcp.host,Kcp#kcp.port,?IKCP_OVERHEAD, Ptr, Kcp#kcp.mtu),
-    case Ack#segment.sn >= Kcp#kcp.rcv_nxt orelse AckList == [] of
+    case Sn >= Kcp#kcp.rcv_nxt orelse AckList == [] of
         true ->
-            flush_acknowledges(AckList, Kcp, Seg#segment{sn = Ack#segment.sn, ts = Ack#segment.ts}, encode(Seg, Ptr));
+            flush_acknowledges(AckList, Kcp, Seg#segment{sn = Sn, ts = Ts}, encode(Seg, Ptr));
         _ ->
             flush_acknowledges(AckList, Kcp, Seg, Ptr1)
     end.
 
 %% 删除Ptr中一个Seg
 encode(Seg, Ptr) ->
-    <<Ptr/bytes,
-        (Seg#segment.conv):32/little-integer
+    <<Ptr/bytes
+%%        ,(Seg#segment.conv):32/little-integer
         ,(Seg#segment.cmd):8/little-integer
         ,(Seg#segment.frg):8/little-integer
         ,(Seg#segment.wnd):16/little-integer
         ,(Seg#segment.ts):32/little-integer
         ,(Seg#segment.sn):32/little-integer
         ,(Seg#segment.una):32/little-integer
-        ,(erlang:length(Seg#segment.data)):32/little-integer
+        ,(erlang:byte_size(Seg#segment.data)):32/little-integer
     >>.
 
 decode(Data) ->
     <<
-        Conv:32/little-integer
-        ,Cmd:8/little-integer
+%%        Conv:32/little-integer
+        Cmd:8/little-integer
         ,Frg:8/little-integer
         ,Wnd:16/little-integer
         ,Ts:32/little-integer
@@ -576,7 +597,7 @@ decode(Data) ->
         ,Len:32/little-integer
         ,Other/bytes
     >> = Data,
-    {Conv, Cmd, Frg, Wnd, Ts, Sn, Una, Len, Other}.
+    {Cmd, Frg, Wnd, Ts, Sn, Una, Len, Other}.
 
 %% makeSpace makes room for writing
 make_space(Socket,Host,Port,Space, Ptr, Mtu) ->
@@ -618,7 +639,7 @@ wnd_unused(Kcp) ->
 %% */
 input(Kcp, Data, Regular, AckNoDelay) ->
     SndUna = Kcp#kcp.snd_una,
-    case erlang:byte_size(Data) < ?IKCP_OVERHEAD of
+    case erlang:byte_size(Data) * 8 < ?IKCP_OVERHEAD of
         true ->
             {Kcp, -1};
         _ ->
@@ -687,14 +708,17 @@ input(Kcp, Data, Regular, AckNoDelay) ->
     end.
 
 loop_decode(Data, Kcp, Regular, WindowSlides, InSegs, Flag, Latest) ->
-    {Conv, Cmd, Frg, Wnd, Ts, Sn, Una, Len, Data1} = decode(Data),
-    case Conv =/= Kcp#kcp.conv of %%判断连续号，确认数据是否应该是目标来源的
+    case erlang:byte_size(Data) * 8 < ?IKCP_OVERHEAD of %%判断连续号，确认数据是否应该是目标来源的
         %% return -1
-        true -> {Flag, Ts, Kcp, WindowSlides};
+        true -> {Kcp, Flag, Latest, WindowSlides};
         _ ->
+            {Cmd, Frg, Wnd, Ts, Sn, Una, Len, Data1} = decode(Data),
+            io:format("Len:~p~n", [Len]),
+            io:format("Data1:~p~n", [Data1]),
+            BLen = Len*8,
             case erlang:byte_size(Data1) < Len of %% 剩余data长度是否小于元数据中指定的数据长度
                 %% return -2
-                true -> {Flag, Ts, Kcp, WindowSlides};
+                true -> {Kcp, Flag, Latest, WindowSlides};
                 _ ->
                     {Flag1, Latest1, Kcp4, WindowSlides2} =
                         case lists:member(Cmd, [?IKCP_CMD_PUSH, ?IKCP_CMD_ACK, ?IKCP_CMD_WASK, ?IKCP_CMD_WINS]) of
@@ -711,25 +735,26 @@ loop_decode(Data, Kcp, Regular, WindowSlides, InSegs, Flag, Latest) ->
                                         Kcp32 = kcp_utils:parse_fast_ack(Kcp31, Sn, Ts), %% 更新快速确认数，判断snd_buf中，是否存在，sn小，ts也比较早的数据，进行快速确认，以便空出空间
                                         {Flag bxor 1, Ts, Kcp32, WindowSlides1};
                                     ?IKCP_CMD_PUSH ->   %% 用户数据
-                                        case Sn < (Kcp#kcp.rcv_nxt + Kcp#kcp.rcv_wnd) of
+                                        case Sn < (Kcp3#kcp.rcv_nxt + Kcp3#kcp.rcv_wnd) of
                                             true ->
-                                                Kcp1 = kcp_utils:ack_push(Kcp, Sn, Ts), %% 更新acklist表
+                                                Kcp31 = kcp_utils:ack_push(Kcp3, Sn, Ts), %% 更新acklist表
                                                 case Sn >= Kcp#kcp.rcv_nxt of
                                                     true ->
+                                                        <<D:BLen, _/bytes>> = Data1,
                                                         Seg = #segment{
-                                                            conv = Conv
-                                                            ,cmd = Cmd
+%%                                                            conv = Conv
+                                                            cmd = Cmd
                                                             ,frg = Frg
                                                             ,wnd = Wnd
                                                             ,ts = Ts
                                                             ,sn = Sn
                                                             ,una = Una
-                                                            ,data = lists:sublist(Data, Len) %% delayed data copying
+                                                            ,data = <<D>> %% delayed data copying
                                                         },
-                                                        {Kcp31, _} = parse_data(Kcp, Seg),
-                                                        {Flag, Latest, Kcp31, WindowSlides1};
+                                                        {Kcp32, _} = parse_data(Kcp31, Seg),
+                                                        {Flag, Latest, Kcp32, WindowSlides1};
                                                     _ ->
-                                                        {Flag, Latest, Kcp3, WindowSlides1}
+                                                        {Flag, Latest, Kcp31, WindowSlides1}
                                                 end;
                                             _ ->
                                                 {Flag, Latest, Kcp3, WindowSlides1}
@@ -746,7 +771,7 @@ loop_decode(Data, Kcp, Regular, WindowSlides, InSegs, Flag, Latest) ->
                                 %% return -3
                                 {Flag, Latest, Kcp, WindowSlides}
                         end,
-                    <<_:Len, Data3/bytes>> = Data1,
+                    <<_:BLen, Data3/bytes>> = Data1,
                     loop_decode(Data3, Kcp4, Regular, WindowSlides2, InSegs + 1, Flag1, Latest1)
             end
     end.
@@ -774,7 +799,7 @@ parse_data(Kcp, Seg) ->
                     _ ->
                         Kcp
                 end,
-            {NewRcvBuf, Kcp2, _Count, AddRcvQueue} = loop_parse_data_2(Kcp1#kcp.rcv_buf, 0, Kcp1, Kcp1#kcp.rcv_queue, []),
+            {NewRcvBuf, Kcp2, _Count, AddRcvQueue} = loop_parse_data_2(Kcp1#kcp.rcv_buf, 0, Kcp1, erlang:length(Kcp1#kcp.rcv_queue), []),
             {Kcp2#kcp{rcv_buf = NewRcvBuf, rcv_queue = Kcp2#kcp.rcv_queue ++ lists:reverse(AddRcvQueue)}, Repeat1}
     end.
 
@@ -818,9 +843,10 @@ loop_parse_data_1(I, [Seg | RcvBuf], Sn, Repeat, InsertIdx) ->
 recv(Kcp) ->
     PeekSize = peek_size(Kcp),
     case PeekSize < 0 of
-        true -> throw(-1)
+        true -> throw(-1);
+        _ -> ok
     end,
-    FastRecover = length(Kcp#kcp.rcv_queue) >= length(Kcp#kcp.rcv_wnd),
+    FastRecover = length(Kcp#kcp.rcv_queue) >= Kcp#kcp.rcv_wnd,
     {Res, N, Count} = merge_fragment(Kcp#kcp.rcv_queue, Kcp, <<>>, 0, 0),
     Kcp1 =
         case Count > 0 of
@@ -872,7 +898,7 @@ peek_size(#kcp{rcv_queue = RcvQueue}) ->
             [#segment{data = Data, frg = Frg}| _] = RcvQueue,
             case Frg of
                 0 ->
-                    length(Data);
+                    erlang:byte_size(Data);
                 _ ->
                     case length(RcvQueue) < Frg + 1 of
                         true -> -1;
@@ -898,7 +924,7 @@ merge_fragment([#segment{data = SegData, frg = SegFrg} | RcvQueue], Kcp, Res, N,
 loop_rcv_queue([], Len) ->
     Len;
 loop_rcv_queue([#segment{data = Data, frg = Frg} | RcvQueue], Len) ->
-    NewLen = Len + length(Data),
+    NewLen = Len + erlang:byte_size(Data),
     case Frg == 0 of
         true ->
             NewLen;
@@ -906,3 +932,49 @@ loop_rcv_queue([#segment{data = Data, frg = Frg} | RcvQueue], Len) ->
             loop_rcv_queue(RcvQueue, NewLen)
     end.
 %%======================================================================================================================
+
+
+%%======================================================================================================================
+%% NoDelay
+%%======================================================================================================================
+%%// NoDelay options
+%%// fastest: ikcp_nodelay(kcp, 1, 20, 2, 1)
+%%// nodelay: 0:disable(default), 1:enable
+%%// interval: internal update timer interval in millisec, default is 100ms
+%%// resend: 0:disable fast resend(default), 1:enable fast resend
+%%// nc: 0:normal congestion control(default), 1:disable congestion control
+no_delay(Kcp, NoDelay, Interval, Resend, Nc) ->
+    Kcp1 =
+        case NoDelay >= 0 of
+            true ->
+                Kcp#kcp{
+                    nodelay = NoDelay,
+                    rx_minrto = ?IF(NoDelay =/= 0, ?IKCP_RTO_NDL, ?IKCP_RTO_MIN)
+                };
+            _ ->
+                Kcp
+        end,
+    Kcp2 =
+        case Interval >= 0 of
+            true ->
+                Kcp1#kcp{
+                    interval = min(max(Interval, 10), 5000)
+                };
+            _ ->
+                Kcp1
+        end,
+    Kcp3 =
+        case Interval >= 0 of
+            true ->
+                Kcp2#kcp{fastresend = Resend};
+            _ ->
+                Kcp2
+        end,
+    Kcp4 =
+        case Interval >= 0 of
+            true ->
+                Kcp3#kcp{nocwnd = Nc};
+            _ ->
+                Kcp3
+        end,
+    Kcp4.
